@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pixelfire — 3 Stages</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;background:#000;overflow:hidden}
+#stage{width:100%;height:100vh;position:relative;overflow:hidden;background:#000}
+canvas{display:block;position:absolute;top:0;left:0;image-rendering:pixelated;image-rendering:crisp-edges}
+#ui{position:absolute;bottom:24px;left:50%;transform:translateX(-50%);display:flex;gap:10px}
+button{background:transparent;border:0.5px solid #ff6600;color:#ff6600;font-family:monospace;font-size:11px;padding:6px 18px;cursor:pointer;border-radius:3px;transition:background 0.15s,opacity 0.15s}
+button:hover:not(:disabled){background:#ff660022}
+button:disabled{opacity:0.25;cursor:default}
+#lbl{position:absolute;top:18px;left:50%;transform:translateX(-50%);color:#ff660055;font-family:monospace;font-size:10px;letter-spacing:3px;pointer-events:none}
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="c"></canvas>
+  <div id="lbl">IDLE</div>
+  <div id="ui">
+    <button id="b1">① Explode</button>
+    <button id="b2" disabled>② Flush</button>
+    <button id="b3" style="display:none">↺ Reset</button>
+  </div>
+</div>
+<script>
+const stage=document.getElementById('stage');
+const canvas=document.getElementById('c');
+const ctx=canvas.getContext('2d');
+const b1=document.getElementById('b1');
+const b2=document.getElementById('b2');
+const b3=document.getElementById('b3');
+const lbl=document.getElementById('lbl');
+
+const P=5;
+let W,H,COLS,ROWS;
+let t=0,lastTs=0;
+
+// phases: idle ↔ exploding ↔ cooling (loop freely)
+//         any phase → burning → done (one-way, destructive)
+let phase='idle';
+let explodeT=0;
+const EXPLODE_DUR=32;
+const COOL_DUR=30;
+let coolT=0;
+
+let heat,heatNext,velX,velY,flicker;
+let burnTop,baseRow,released,colSpeed,relSpeed,releaseAt,colOffset,colGone;
+
+const IDLE_BASE=5;
+
+const PAL=[
+  null,
+  '#0d0000','#2a0500','#4d0a00','#7a1000',
+  '#aa1a00','#cc2800','#ee4000','#ff5500',
+  '#ff7200','#ff9000','#ffaa00','#ffcc22',
+  '#ffdd66','#ffee99',
+];
+const PAL_MAX=PAL.length-1;
+
+function heatToIdx(v,fl){
+  if(v<0.04) return 0;
+  let idx=Math.round(Math.pow(v,1.35)*0.88*PAL_MAX);
+  if(fl>0.6&&idx>2) idx-=Math.floor(fl*2.5);
+  if(v>0.96&&Math.random()<0.04) idx=PAL_MAX;
+  return Math.max(0,Math.min(PAL_MAX,idx));
+}
+
+function rnd(a,b){return a+Math.random()*(b-a)}
+
+function resize(){
+  W=stage.offsetWidth; H=stage.offsetHeight;
+  canvas.width=W; canvas.height=H;
+  COLS=Math.ceil(W/P); ROWS=Math.ceil(H/P);
+}
+
+function alloc(){
+  const n=COLS*ROWS;
+  heat=new Float32Array(n);
+  heatNext=new Float32Array(n);
+  velX=new Float32Array(n);
+  velY=new Float32Array(n);
+  flicker=new Float32Array(n);
+  burnTop=new Float32Array(COLS);
+  baseRow=new Float32Array(COLS);
+  released=new Uint8Array(COLS);
+  colSpeed=new Float32Array(COLS);
+  relSpeed=new Float32Array(COLS);
+  releaseAt=new Float32Array(COLS);
+  colOffset=new Float32Array(COLS);
+  colGone=new Uint8Array(COLS);
+}
+
+function initBurnCols(){
+  for(let c=0;c<COLS;c++){
+    burnTop[c]=ROWS+rnd(0,3);
+    baseRow[c]=ROWS;
+    released[c]=0;
+    colSpeed[c]=rnd(1.5,2.8);
+    relSpeed[c]=rnd(2.2,4.0);
+    releaseAt[c]=rnd(0.60,0.85);
+    colOffset[c]=0;
+    colGone[c]=0;
+  }
+}
+
+function ns(x,y,tm,ox,oy){
+  return Math.sin(x*0.9+tm*2.3+ox)*0.38
+        +Math.sin(y*0.7-tm*1.8+oy)*0.28
+        +Math.sin(x*1.7+y*0.5+tm*3.1+ox*0.6)*0.20
+        +Math.sin(x*0.4-y*1.1+tm*1.2+oy*0.5)*0.14;
+}
+function ns2(x,y,tm,ox){
+  return Math.sin(x*2.3+tm*5.1+ox)*0.40
+        +Math.sin(y*1.8-tm*4.3+ox*0.7)*0.35
+        +Math.sin(x*3.1+y*2.2+tm*6.5+ox*0.4)*0.25;
+}
+
+function seedBottom(str=1.0){
+  for(let c=0;c<COLS;c++){
+    heat[c+(ROWS-1)*COLS]=rnd(0.72,0.82)*str;
+    heat[c+(ROWS-2)*COLS]=rnd(0.66,0.78)*str;
+    heat[c+(ROWS-3)*COLS]=rnd(0.55,0.72)*str;
+    heat[c+(ROWS-4)*COLS]=rnd(0.42,0.62)*str;
+    if(Math.random()<0.18){
+      const r=ROWS-5-Math.floor(rnd(0,5));
+      if(r>=0) heat[c+r*COLS]=Math.max(heat[c+r*COLS],rnd(0.50,0.72)*str);
+    }
+  }
+}
+
+function seedExplosion(progress){
+  const peak=Math.sin(progress*Math.PI);
+  const burstH=Math.floor(ROWS*0.60*peak);
+  const str=Math.min(0.88,0.72+peak*0.14);
+  for(let c=0;c<COLS;c++){
+    const cn=Math.abs(ns(c*0.2,0,t,c*0.05,0));
+    const colH=Math.floor(burstH*(0.5+cn*0.7));
+    for(let k=0;k<colH;k++){
+      const r=ROWS-1-k; if(r<0) break;
+      const frac=1-(k/Math.max(1,colH));
+      heat[c+r*COLS]=Math.max(heat[c+r*COLS],Math.min(0.88,frac*frac*str*(0.6+cn*0.4)));
+    }
+  }
+  const kicks=Math.floor(COLS*0.8);
+  for(let k=0;k<kicks;k++){
+    const c=Math.floor(Math.random()*COLS);
+    const r=Math.floor(rnd(ROWS*(1-0.60*peak),ROWS-1));
+    const i=c+r*COLS;
+    velX[i]+=(Math.random()-0.5)*8*peak;
+    velY[i]-=Math.random()*7*peak;
+  }
+}
+
+function updateFlicker(){
+  for(let r=0;r<ROWS;r++){
+    for(let c=0;c<COLS;c++){
+      flicker[c+r*COLS]=Math.abs(ns2(c*0.25,r*0.22,t,c*0.08+r*0.05));
+    }
+  }
+}
+
+function buildVelocityField(){
+  for(let r=0;r<ROWS;r++){
+    for(let c=0;c<COLS;c++){
+      const i=c+r*COLS;
+      const h=heat[i];
+      const hL=c>0?heat[(c-1)+r*COLS]:h;
+      const hR=c<COLS-1?heat[(c+1)+r*COLS]:h;
+      const hU=r>0?heat[c+(r-1)*COLS]:h;
+      const hD=r<ROWS-1?heat[c+(r+1)*COLS]:h;
+      const nx=ns(c*0.13,r*0.11,t,c*0.04,r*0.06);
+      const nx2=ns(c*0.08+40,r*0.14+20,t*1.3,r*0.05,c*0.07);
+      velX[i]=(hR-hL)*1.4+nx*1.3+nx2*0.9;
+      velY[i]=-(hD-hU)*0.8-h*1.6+ns(c*0.16,r*0.09,t*0.8,50,80)*0.55;
+    }
+  }
+}
+
+function advectHeat(dt,maskAbove=-1){
+  const scale=dt*0.50;
+  for(let r=1;r<ROWS-1;r++){
+    for(let c=0;c<COLS;c++){
+      const i=c+r*COLS;
+      const bx=c-velX[i]*scale,by=r-velY[i]*scale;
+      const x0=Math.floor(bx),x1=x0+1;
+      const y0=Math.floor(by),y1=y0+1;
+      const fx=bx-x0,fy=by-y0;
+      const cx0=Math.max(0,Math.min(COLS-1,x0));
+      const cx1=Math.max(0,Math.min(COLS-1,x1));
+      const cy0=Math.max(0,Math.min(ROWS-1,y0));
+      const cy1=Math.max(0,Math.min(ROWS-1,y1));
+      let v=(heat[cx0+cy0*COLS]*(1-fx)+heat[cx1+cy0*COLS]*fx)*(1-fy)
+           +(heat[cx0+cy1*COLS]*(1-fx)+heat[cx1+cy1*COLS]*fx)*fy;
+      v*=0.962+(r/ROWS)*0.022;
+      v=Math.min(v,0.88);
+      if(v<0.40) v=Math.max(v,Math.max(heat[cx0+cy1*COLS],heat[cx1+cy1*COLS])*0.26);
+      const navg=(heat[cx0+r*COLS]+heat[cx1+r*COLS]+heat[c+cy0*COLS]+heat[c+cy1*COLS])*0.25;
+      if(navg>0.35) v=Math.max(v,navg*0.48);
+      const fl=flicker[i];
+      if(fl>0.72&&Math.random()<0.35) v*=rnd(0.55,0.80);
+      if(maskAbove>=0&&r<maskAbove) v*=0.04;
+      heatNext[i]=Math.max(0,Math.min(0.88,v));
+    }
+  }
+  const tmp=heat;heat=heatNext;heatNext=tmp;
+}
+
+function addTurbulence(){
+  const kicks=Math.floor(COLS*0.45);
+  for(let k=0;k<kicks;k++){
+    const c=Math.floor(Math.random()*COLS);
+    const r=Math.floor(rnd(ROWS*0.04,ROWS*0.90));
+    const i=c+r*COLS;
+    if(heat[i]>0.06){velX[i]+=(Math.random()-0.5)*5.0;velY[i]-=Math.random()*3.0;}
+  }
+}
+
+const embers=[];
+function spawnEmber(fromRow,intensity=1){
+  if(Math.random()>0.45*intensity) return;
+  const c=Math.floor(Math.random()*COLS);
+  embers.push({
+    x:c*P+rnd(-P*5*intensity,P*5*intensity),
+    y:fromRow*P,
+    vx:rnd(-2,2)*intensity,
+    vy:-rnd(1.5,5)*intensity,
+    life:~~rnd(15,60),max:60,
+    col:Math.random()>0.45?'#ffaa00':Math.random()>0.5?'#ff6600':'#cc2800',
+    sz:Math.random()>0.55?P:3,
+    streak:false
+  });
+}
+
+// Rising streaks: shoot upward fast from the explosion front, like burning-phase sparks
+function spawnExplosionStreaks(peak){
+  // number of streaks scales with peak intensity
+  const count=Math.floor(peak*8);
+  for(let k=0;k<count;k++){
+    // spawn from random height within the explosion's current fire zone
+    const fromFrac=rnd(0.25,0.85); // where in the screen the streak originates
+    const fromRow=Math.floor(ROWS*(1-fromFrac*peak));
+    const c=Math.floor(Math.random()*COLS);
+    // streaks go nearly straight up with slight drift, fast
+    const speed=rnd(3.5,8.0)*peak;
+    embers.push({
+      x:c*P+rnd(-P*3,P*3),
+      y:fromRow*P,
+      vx:rnd(-0.8,0.8),
+      vy:-speed,
+      life:~~rnd(30,90),
+      max:90,
+      col:Math.random()>0.5?'#ffcc00':Math.random()>0.5?'#ffaa00':'#ff7700',
+      sz:Math.random()>0.4?P:3,
+      streak:true,
+      trail:[] // leave a fading trail
+    });
+  }
+}
+function drawEmbers(){
+  for(let i=embers.length-1;i>=0;i--){
+    const e=embers[i];
+    // store trail position before moving (streaks only)
+    if(e.streak&&e.trail){
+      e.trail.push({x:~~(e.x/P)*P,y:~~(e.y/P)*P,a:e.life/e.max});
+      if(e.trail.length>6) e.trail.shift();
+    }
+    e.x+=e.vx;
+    e.y+=e.vy;
+    // streaks barely decelerate — they fly straight up
+    e.vy+=e.streak?0.12:0.07;
+    e.vx*=e.streak?0.99:0.96;
+    e.life--;
+    if(e.life<=0||e.y<-P*4){embers.splice(i,1);continue;}
+    // draw trail for streaks
+    if(e.streak&&e.trail){
+      for(let j=0;j<e.trail.length;j++){
+        const tp=e.trail[j];
+        ctx.globalAlpha=tp.a*(j/e.trail.length)*0.5;
+        ctx.fillStyle=e.col;
+        ctx.fillRect(tp.x,tp.y,e.sz,e.sz);
+      }
+    }
+    ctx.globalAlpha=e.life/e.max;
+    ctx.fillStyle=e.col;
+    ctx.fillRect(~~(e.x/P)*P,~~(e.y/P)*P,e.sz,e.sz);
+  }
+  ctx.globalAlpha=1;
+}
+
+function drawIdle(){
+  const cutoff=ROWS-IDLE_BASE-1;
+  for(let c=0;c<COLS;c++){
+    const tn=ns(c*0.18,0,t*2.0,c*0.03,0);
+    const tn2=ns2(c*0.22,0,t*1.8,c*0.06+10);
+    const tip=Math.floor(Math.abs(tn)*4+Math.abs(tn2)*3);
+    const top=cutoff-tip;
+    for(let r=top;r<ROWS;r++){
+      if(r<0||r>=ROWS) continue;
+      let h=heat[c+r*COLS];
+      const fb=ROWS-1-r,tot=ROWS-1-top;
+      if(tot>0) h*=1-(fb/tot)*0.45;
+      const fl=flicker[c+r*COLS]||0;
+      const idx=heatToIdx(h,fl);
+      if(idx>0){ctx.fillStyle=PAL[idx];ctx.fillRect(c*P,r*P,P,P);}
+    }
+    if(Math.random()<0.004) spawnEmber(top,0.6);
+  }
+}
+
+function drawHeatMap(){
+  for(let r=0;r<ROWS;r++){
+    for(let c=0;c<COLS;c++){
+      const h=heat[c+r*COLS];
+      if(h<0.04) continue;
+      const fl=flicker[c+r*COLS]||0;
+      const idx=heatToIdx(h,fl);
+      if(idx>0){ctx.fillStyle=PAL[idx];ctx.fillRect(c*P,r*P,P,P);}
+    }
+  }
+}
+
+function drawBurning(){
+  let allGone=true;
+  for(let c=0;c<COLS;c++){
+    if(colGone[c]) continue;
+    allGone=false;
+    if(!released[c]){
+      burnTop[c]-=colSpeed[c];
+      if(1-(burnTop[c]/ROWS)>=releaseAt[c]) released[c]=1;
+    } else {
+      burnTop[c]-=relSpeed[c]*1.1;
+      baseRow[c]-=relSpeed[c];
+      colOffset[c]+=relSpeed[c];
+    }
+    if(burnTop[c]<-16&&baseRow[c]<-8){colGone[c]=1;continue;}
+    const top=Math.floor(burnTop[c]);
+    const base=released[c]?Math.ceil(baseRow[c]):ROWS-1;
+    const off=Math.floor(colOffset[c]);
+    for(let r=top;r<=base;r++){
+      if(r<0||r>=ROWS) continue;
+      const srcR=r+off;
+      let h=srcR>=ROWS?rnd(0.65,0.80):srcR<0?0:heat[c+srcR*COLS];
+      if(!released[c]){const fb=ROWS-1-r;if(fb<6)h=Math.max(h,0.70-fb*0.04);}
+      const ft=r-top;if(ft<5)h*=(ft+1)/5;
+      const fl=flicker[c+(r>=0&&r<ROWS?r:0)*COLS]||0;
+      const idx=heatToIdx(h,fl);
+      if(idx>0){ctx.fillStyle=PAL[idx];ctx.fillRect(c*P,r*P,P,P);}
+    }
+    const tn=ns(c*0.18,0,t*2.2,colOffset[c]*0.12,0);
+    const tn2=ns(c*0.30,0,t*3.5,colOffset[c]*0.07+22,11);
+    const tn3=ns2(c*0.20,0,t*1.5,colOffset[c]*0.05+44);
+    const tipH=Math.floor(4+Math.abs(tn)*8+Math.abs(tn2)*5+Math.abs(tn3)*3);
+    for(let k=1;k<=tipH;k++){
+      const r=top-k;if(r<0)break;
+      const h=Math.max(0,(tipH-k+1)/tipH*0.58*(0.35+Math.abs(tn)*0.65));
+      const fl=flicker[Math.max(0,c+(r>=0&&r<ROWS?r:0)*COLS)]||0;
+      const idx=heatToIdx(h,fl);
+      if(idx>0){ctx.fillStyle=PAL[idx];ctx.fillRect(c*P,r*P,P,P);}
+    }
+    spawnEmber(top,1);
+  }
+  return allGone;
+}
+
+// ── MAIN LOOP ──────────────────────────────────────────────
+
+function animate(ts){
+  requestAnimationFrame(animate);
+  const dt=Math.min((ts-lastTs)/16.67,2.5);
+  lastTs=ts;
+  t+=0.040*dt;
+
+  ctx.fillStyle='#000';
+  ctx.fillRect(0,0,W,H);
+
+  updateFlicker();
+  buildVelocityField();
+  addTurbulence();
+
+  if(phase==='idle'){
+    seedBottom(1.0);
+    advectHeat(dt,ROWS-IDLE_BASE-6);
+    drawIdle();
+
+  } else if(phase==='exploding'){
+    explodeT+=dt;
+    const progress=Math.min(explodeT/EXPLODE_DUR,1);
+    seedBottom(1.0);
+    seedExplosion(progress);
+    advectHeat(dt,-1);
+    drawHeatMap();
+    const peak=Math.sin(progress*Math.PI);
+    // regular embers from explosion body
+    for(let k=0;k<Math.floor(peak*2);k++)
+      spawnEmber(Math.floor(ROWS*(0.4+Math.random()*0.4)),1.0+peak*0.5);
+    // rising streaks shooting upward through the screen
+    spawnExplosionStreaks(peak);
+    if(progress>=1){
+      phase='cooling';
+      coolT=0;
+      lbl.textContent='COOLING';
+    }
+
+  } else if(phase==='cooling'){
+    coolT+=dt;
+    const progress=Math.min(coolT/COOL_DUR,1);
+    // mask creeps back in from top as fire settles
+    const mask=Math.floor((ROWS-IDLE_BASE-6)*progress);
+    seedBottom(1.0);
+    advectHeat(dt,mask>2?mask:-1);
+    if(progress<0.6) drawHeatMap(); else drawIdle();
+    // spawn a few fading streaks at start of cool-down
+    if(progress<0.3) spawnExplosionStreaks(1-progress*3);
+    if(progress>=1){
+      phase='idle';
+      lbl.textContent='IDLE';
+      b1.disabled=false;
+      // flush stays enabled — user can flush from idle any time after first explode
+    }
+
+  } else if(phase==='burning'){
+    advectHeat(dt,-1);
+    const done=drawBurning();
+    if(done){
+      phase='done';
+      lbl.textContent='DONE';
+      b3.style.display='inline-block';
+      b1.style.display='none';
+      b2.style.display='none';
+    }
+  }
+
+  drawEmbers();
+}
+
+// ── PUBLIC API ─────────────────────────────────────────────
+// fireExplode(): idle/cooling/exploding → exploding (restartable, loops back to idle)
+// fireFlush():   any non-done phase → burning (one-way, destructive)
+
+window.fireExplode=function(){
+  if(phase==='burning'||phase==='done') return;
+  phase='exploding';
+  explodeT=0;
+  lbl.textContent='EXPLODE';
+  b1.disabled=true;
+  b2.disabled=false; // flush becomes available after first explode
+};
+
+window.fireFlush=function(){
+  if(phase==='done') return;
+  phase='burning';
+  initBurnCols();
+  embers.length=0;
+  lbl.textContent='FLUSH';
+  b1.disabled=true;
+  b2.disabled=true;
+};
+
+// ── INIT ───────────────────────────────────────────────────
+
+function warmup(){
+  for(let i=0;i<120;i++){
+    seedBottom(1.0);
+    buildVelocityField();
+    addTurbulence();
+    advectHeat(1,ROWS-IDLE_BASE-6);
+    t+=0.040;
+  }
+}
+
+function init(){
+  phase='idle'; explodeT=0; coolT=0;
+  embers.length=0;
+  lbl.textContent='IDLE';
+  b1.disabled=false; b1.style.display='inline-block';
+  b2.disabled=true;  b2.style.display='inline-block';
+  b3.style.display='none';
+  resize(); alloc();
+  seedBottom(1.0);
+  warmup();
+}
+
+b1.addEventListener('click',()=>window.fireExplode());
+b2.addEventListener('click',()=>window.fireFlush());
+b3.addEventListener('click',()=>init());
+window.addEventListener('resize',()=>init());
+
+resize();
+requestAnimationFrame((ts)=>{lastTs=ts;animate(ts);});
+init();
+</script>
+</body>
+</html>
